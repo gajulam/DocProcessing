@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template for DocProc Textract IMplementation.
+Parameters:
+  EnvName:
+    Type: String
+    Description: Name of an environment. 'dev', 'staging', 'prod' and any name.
+    AllowedPattern: ^.*[^0-9]$
+    ConstraintDescription: Must end with non numberic character.
+Outputs:
+  LambdaRoleARN:
+    Description: Role for Lambda execution.
+    Value:
+      Fn::GetAtt:
+        - LambdaRole
+        - Arn
+    Export:
+      Name:
+        Fn::Sub: LambdaRole
+  LambdaFunctionName1:
+    Value:
+      Ref: LambdaFunction1
+
+Resources:
+  DocProcessingBucket:
+    Type: 'AWS::S3::Bucket'
+
+  TaskQueue1:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 1600
+      QueueName: DocProcApp-Textract-AsyncTextract-Req
+
+
+  TaskQueue2:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 6000
+      QueueName: DocProcApp-Textract-JobQ-Req
+
+  TaskQueue2Policy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+     PolicyDocument:
+      Version: '2012-10-17'
+      Id: MyQueuePolicy
+      Statement:
+       Effect: Allow
+       Principal: "*"
+       Action:
+       - sqs:SendMessage
+       Resource: !GetAtt TaskQueue2.Arn
+       Condition:
+        ArnEquals:
+         aws:SourceArn: !Ref SnsTopic1
+     Queues:
+      - !Ref TaskQueue2
+
+
+
+
+
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: lambda-DocProc-execution-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+
+                Resource: !GetAtt DocProcessingBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+
+                Resource: 'arn:aws:logs:*:*:*'
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchEventsFullAccess
+        - arn:aws:iam::aws:policy/AmazonTextractFullAccess
+        - arn:aws:iam::aws:policy/ComprehendMedicalFullAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+
+      Path: /
+  TextractRole1:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        -textarct-service-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - textract.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  LambdaFunction1:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: lambda-function-DocProc-S3-trigger-${EnvName}
+      Description: LambdaFunction of python3.7.
+      Runtime: python3.7
+      Code:
+        S3Bucket: amatchgen
+        S3Key: DocProcessing/DocProcS3Upload.zip
+
+      Handler: lambda_function.lambda_handler
+      MemorySize: 542
+      Timeout: 900
+      Role:
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+      Environment:
+        Variables:
+          ENV:
+            Fn::Sub: ${EnvName}
+          DOCUMENTS_TABLE: "MasterDBx"
+          OUTPUT_TABLE: "DetailDBx"
+          BUCKET: !Ref DocProcessingBucket
+      Timeout: "900"
+
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+
+            print('Loading function')
+            s3 = boto3.resource('s3')
+
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'
+                          ]
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.6
+      Timeout: 50
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LambdaFunction1.Arn
+      Bucket: !Ref DocProcessingBucket
+
+
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunction1
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DocProcessingBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+
+
+  LambdaFunction2:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: lambda-function-SQS-load-${EnvName}
+      Description: LambdaFunction for textract Async of python3.7.
+      Runtime: python3.7
+      Code:
+        S3Bucket: amatchgen
+        S3Key: DocProcessing/DocProc-SQS-load-processing.zip
+
+      Handler: lambda_function.lambda_handler
+      MemorySize: 542
+      Timeout: 900
+      Role:
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+      Environment:
+        Variables:
+          ENV:
+            Fn::Sub: ${EnvName}
+          ASYNC_QUEUE_URL: !Ref TaskQueue1
+          SYNC_QUEUE_URL: "SyncSQS"
+          SNS_TOPIC_ARN: !Ref SnsTopic1
+          SNS_ROLE_ARN:  !GetAtt TextractRole1.Arn
+          BUCKET: !Ref DocProcessingBucket
+      Timeout: "900"
+
+  SnsTopic0:
+      Type: AWS::SNS::Topic
+      Properties:
+          TopicName: DocProcApp-Textract-Pipeline-Trigger
+          Subscription:
+             - Protocol: lambda
+               Endpoint: !GetAtt LambdaFunction2.Arn
+
+
+  LambdaFunctionSqsEventSource:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    DependsOn:
+          - "DocumentsTable1234"
+    Properties:
+      EventSourceArn: !GetAtt DocumentsTable1234.StreamArn
+      FunctionName: !Ref LambdaFunction2
+      BatchSize: 1
+      StartingPosition: TRIM_HORIZON
+
+
+
+
+  LambdaFunction3:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: lambda-function-Async-Processing-${EnvName}
+      Description: LambdaFunction for textract JobQ Processing of python3.7.
+      Runtime: python3.7
+      Code:
+        S3Bucket: amatchgen
+        S3Key: DocProcessing/DocProc-Async-processing.zip
+
+      Handler: lambda_function.lambda_handler
+      MemorySize: 542
+      Timeout: 900
+      Role:
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+
+      Environment:
+        Variables:
+          ENV:
+            Fn::Sub: ${EnvName}
+          TZ: UTC
+          DOCUMENTS_TABLE: !Ref DocumentsTable1234
+          OUTPUT_TABLE: "DetailDBx"
+          ASYNC_QUEUE_URL: !Ref TaskQueue1
+          BUCKET: !Ref DocProcessingBucket
+          SNS_TOPIC_ARN: !Ref SnsTopic1
+          SNS_ROLE_ARN: !GetAtt TextractRole1.Arn
+          TEXTRACT_PIPELINE_COMPLETE_SNS_ARN: !Ref SnsTopic2
+      Timeout: "900"
+
+
+
+  Rule4C995B7F:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: rate(2 minutes)
+      State: ENABLED
+      Targets:
+        - Arn:
+            'Fn::GetAtt':
+              - LambdaFunction3
+              - Arn
+          Id: ASyncProcessor
+
+
+
+
+  PermissionForEventsToInvokeLambda:
+   Type: AWS::Lambda::Permission
+   Properties:
+     FunctionName:
+       Ref: "LambdaFunction3"
+     Action: "lambda:InvokeFunction"
+     Principal: "events.amazonaws.com"
+     SourceArn: !GetAtt Rule4C995B7F.Arn
+
+
+
+  LambdaFunction4:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName:
+          Fn::Sub: lambda-function-jobQ-processing-${EnvName}
+        Description: LambdaFunction for RFP predictions updaing DynamDB.
+        Runtime: python3.7
+        Code:
+          S3Bucket: amatchgen
+          S3Key: DocProcessing/DocProc-JobQ-processing.zip
+
+        Handler: lambda_function.lambda_handler
+        MemorySize: 542
+        Timeout: 900
+        Role:
+          Fn::GetAtt:
+            - LambdaRole
+            - Arn
+
+        Environment:
+          Variables:
+            ENV:
+              Fn::Sub: ${EnvName}
+            TZ: UTC
+            DOCUMENTS_TABLE: !Ref DocumentsTable1234
+            OUTPUT_TABLE: "dummyoutput"
+            SNS_TOPIC_ARN: !Ref SnsTopic2
+            BUCKET_NAME: !Ref DocProcessingBucket
+        Timeout: "900"
+
+  LambdaFunction5:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName:
+          Fn::Sub: lambda-function-Comp-Medical-processing-${EnvName}
+        Description: LambdaFunction for RFP predictions from DynamDB.
+        Runtime: python3.7
+        Code:
+          S3Bucket: amatchgen
+          S3Key: DocProcessing/DocProc-Comp-Medical-processing.zip
+
+        Handler: lambda_function.lambda_handler
+        MemorySize: 542
+        Timeout: 900
+        Role:
+          Fn::GetAtt:
+            - LambdaRole
+            - Arn
+
+        Environment:
+          Variables:
+            ENV:
+              Fn::Sub: ${EnvName}
+            TZ: UTC
+            MASTER_TABLE: !Ref DocumentsTable1234
+            OUTPUT_TABLE: "DetailDBx"
+            BUCKET: !Ref DocProcessingBucket
+            SNS_TOPIC_ARN: !Ref SnsTopic3
+        Timeout: "900"
+
+  LambdaFunction6:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName:
+          Fn::Sub: lambda-function-Comp-Medical-Summary-processing-${EnvName}
+        Description: LambdaFunction for RFP predictions from DynamDB.
+        Runtime: python3.7
+        Code:
+          S3Bucket: amatchgen
+          S3Key: DocProcessing/DocProc-Comp-Medical-Summary-processing.zip
+
+        Handler: lambda_function.lambda_handler
+        MemorySize: 542
+        Timeout: 900
+        Role:
+          Fn::GetAtt:
+            - LambdaRole
+            - Arn
+
+        Environment:
+          Variables:
+            ENV:
+              Fn::Sub: ${EnvName}
+            TZ: UTC
+            MASTER_TABLE: !Ref DocumentsTable1234
+            OUTPUT_TABLE: "DetailDBx"
+            BUCKET: !Ref DocProcessingBucket
+        Timeout: "900"
+
+
+  SnsTopic1:
+      Type: AWS::SNS::Topic
+      Properties:
+          TopicName: DocProcApp-Textract-AsyncJobCompletion
+          Subscription:
+            - Endpoint:
+                Fn::GetAtt:
+                  - "TaskQueue2"
+                  - "Arn"
+              Protocol: "sqs"
+
+
+
+  lambdaSNSInvoke:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "LambdaFunction2.Arn"
+      Principal: "sns.amazonaws.com"
+      SourceArn:
+        Ref: SnsTopic0
+
+  SnsTopic2:
+      Type: AWS::SNS::Topic
+      Properties:
+          TopicName: DocProcApp-Textract-Pipeline-Completion
+
+  SnsTopic3:
+      Type: AWS::SNS::Topic
+      Properties:
+          TopicName: DocProcApp-Comp-Medical-Entity-Completion
+
+
+
+  lambdaSNSInvoke5:
+    Type: "AWS::Lambda::Permission"
+    DependsOn:
+        - "LambdaFunction4"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "LambdaFunction5.Arn"
+      Principal: "sns.amazonaws.com"
+      SourceArn:
+        Ref: SnsTopic2
+
+
+  lambdaSNSInvoke6:
+    Type: "AWS::Lambda::Permission"
+    DependsOn:
+        - "LambdaFunction5"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "LambdaFunction6.Arn"
+      Principal: "sns.amazonaws.com"
+      SourceArn:
+        Ref: SnsTopic3
+
+
+  SNMSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref SnsTopic2
+      Endpoint: !GetAtt LambdaFunction5.Arn
+      Protocol: lambda
+
+  SNSSubscription3:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref SnsTopic3
+      Endpoint: !GetAtt LambdaFunction6.Arn
+      Protocol: lambda
+
+
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn:
+            - "LambdaFunction3"
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt TaskQueue2.Arn
+      FunctionName: !GetAtt LambdaFunction4.Arn
+
+
+  DocumentsTable1234:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: MasterDBx
+
+        KeySchema:
+          - AttributeName: documentId
+            KeyType: HASH
+        AttributeDefinitions:
+          - AttributeName: documentId
+            AttributeType: S
+          - AttributeName: aimlRecordId
+            AttributeType: S
+
+        ProvisionedThroughput:
+          ReadCapacityUnits: 3
+          WriteCapacityUnits: 3
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        GlobalSecondaryIndexes:
+        - IndexName: myGSIaiMlId
+          KeySchema:
+          - AttributeName: aimlRecordId
+            KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: "5"
+            WriteCapacityUnits: "5"
